@@ -24,6 +24,7 @@ public class SpectatorWorkarounds implements Listener {
     private final Map<UUID, UUID> tempTargets = new HashMap<>();
     private boolean directTeleportFailed;
     private boolean cameraPacketFailed;
+    private boolean suppressStopSpectatingEvent;
 
     public SpectatorWorkarounds(SpectatorPlugin plugin) {
         this.plugin = plugin;
@@ -35,33 +36,47 @@ public class SpectatorWorkarounds implements Listener {
         Bukkit.getPluginManager().registerEvents(this, plugin);
     }
 
+    /**
+     * Garder le spectateur collé à sa cible quand ils sont dans le MÊME monde.
+     * On ne tente jamais de teleport cross-world ici.
+     */
     private void updateSpectatorPositions() {
         for (final Player spectator : Bukkit.getOnlinePlayers()) {
             final Entity target = spectator.getSpectatorTarget();
 
-            if (target != null) {
-                if (spectator.getWorld().equals(target.getWorld())) {
-                    if (!this.directTeleportFailed) {
-                        try {
-                            ReflectionUtil.directTeleport(spectator, target.getLocation());
-                        } catch (Throwable e) {
-                            this.directTeleportFailed = true;
-                            this.plugin.getSLF4JLogger().warn("auto-update-position workaround: Failed to call directTeleport, will not try again", e);
-                            if (this.plugin.getServerConfig().workaroundsAllowFallback) {
-                                this.plugin.getSLF4JLogger().warn("\"allow-fallback\" is enabled in the plugin configuration. This has a few drawbacks, it is recommended to view the notes in the config about this option.");
-                            }
+            if (target != null && spectator.getWorld().equals(target.getWorld())) {
+                if (!this.directTeleportFailed) {
+                    try {
+                        ReflectionUtil.directTeleport(spectator, target.getLocation());
+                    } catch (Throwable e) {
+                        this.directTeleportFailed = true;
+                        this.plugin.getSLF4JLogger().warn(
+                            "auto-update-position workaround: Failed to call directTeleport, will not try again",
+                            e
+                        );
+                        if (this.plugin.getServerConfig().workaroundsAllowFallback) {
+                            this.plugin.getSLF4JLogger().warn(
+                                "\"allow-fallback\" is enabled in the plugin configuration. " +
+                                "This has a few drawbacks, it is recommended to view the notes in the config about this option."
+                            );
                         }
                     }
+                }
 
-                    if (this.directTeleportFailed && this.plugin.getServerConfig().workaroundsAllowFallback) {
-                        spectator.setSpectatorTarget(null);
-                        spectator.setSpectatorTarget(target);
-                    }
+                if (this.directTeleportFailed && this.plugin.getServerConfig().workaroundsAllowFallback) {
+                    // Fallback vanilla : clear + re-apply, mais toujours dans le même monde
+                    spectator.setSpectatorTarget(null);
+                    spectator.setSpectatorTarget(target);
                 }
             }
         }
     }
 
+    /**
+     * La cible est untracked (souvent parce qu'elle s'est tp loin ou a changé de monde).
+     * - Même monde : on essaie le directTeleport.
+     * - Monde différent : on fait un teleport Bukkit avec cause SPECTATE.
+     */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onUntrack(PlayerUntrackEntityEvent event) {
         if (!this.plugin.getServerConfig().workaroundTeleportOnUntrack || !event.getPlayer().isConnected()) {
@@ -75,22 +90,34 @@ public class SpectatorWorkarounds implements Listener {
             return;
         }
 
-        // the target has been untracked by the spectator. this is usually caused by the target teleporting a long
-        // distance. so here, we need to teleport the spectator to the target, and wait for the PlayerTrackEntityEvent
-        // and re-apply the spectator target.
-        // this would be a lot simpler if Paper let us cancel the PlayerUntrackEntityEvent
-
+        // la cible a été untrack : on veut garder le spectateur dessus
         this.tempTargets.put(spectator.getUniqueId(), target.getUniqueId());
 
-        if (!this.directTeleportFailed) {
+        final boolean sameWorld = spectator.getWorld().equals(target.getWorld());
+
+        // Essayer le directTeleport UNIQUEMENT si même monde
+        if (!this.directTeleportFailed && sameWorld) {
             try {
                 ReflectionUtil.directTeleport(spectator, target.getLocation());
+                return;
             } catch (Throwable e) {
                 this.directTeleportFailed = true;
             }
         }
 
-        if (this.directTeleportFailed && this.plugin.getServerConfig().workaroundsAllowFallback) {
+        // Fallback : on utilise un teleport Bukkit
+        if (this.plugin.getServerConfig().workaroundsAllowFallback) {
+            if (!sameWorld) {
+                // On doit nettoyer le spectate côté serveur AVANT de changer de monde,
+                // sinon le client peut se retrouver à spectate une entité dans un autre dimension -> Network protocol error.
+                this.suppressStopSpectatingEvent = true;
+                try {
+                    spectator.setSpectatorTarget(null);
+                } finally {
+                    this.suppressStopSpectatingEvent = false;
+                }
+            }
+
             spectator.teleport(target, PlayerTeleportEvent.TeleportCause.SPECTATE);
         }
     }
@@ -105,20 +132,25 @@ public class SpectatorWorkarounds implements Listener {
         final Entity target = event.getEntity();
 
         if (this.tempTargets.remove(spectator.getUniqueId(), target.getUniqueId()) && !event.isCancelled()) {
-            // we need to schedule the re-apply for a tick later, as the target is not actually tracked yet when
-            // PlayerTrackEntityEvent is called.
+            // On doit ré-appliquer un tick plus tard, sinon la cible n'est pas encore vraiment trackée
             Bukkit.getScheduler().runTask(this.plugin, () -> {
                 if (!this.cameraPacketFailed) {
                     try {
-                        // attempt to send ClientboundSetCameraPacket directly to the spectator as that's all that is really
-                        // needed, and we can try to skip the logic in setSpectatorTarget() which includes teleporting and
-                        // calling PlayerStartSpectatingEntityEvent.
+                        // Essayer d'envoyer directement le packet camera pour éviter la logique
+                        // complète de setSpectatorTarget (qui fait un teleport en plus)
                         ReflectionUtil.sendCameraPacket(spectator, target);
+                        return;
                     } catch (Throwable e) {
                         this.cameraPacketFailed = true;
-                        this.plugin.getSLF4JLogger().warn("auto-teleport-on-untrack workaround: Failed to send ClientboundSetCameraPacket directly", e);
+                        this.plugin.getSLF4JLogger().warn(
+                            "auto-teleport-on-untrack workaround: Failed to send ClientboundSetCameraPacket directly",
+                            e
+                        );
                         if (this.plugin.getServerConfig().workaroundsAllowFallback) {
-                            this.plugin.getSLF4JLogger().warn("\"allow-fallback\" is enabled in the plugin configuration, falling back to Bukkit setSpectatorTarget(). This is unlikely to cause issues.");
+                            this.plugin.getSLF4JLogger().warn(
+                                "\"allow-fallback\" is enabled in the plugin configuration, " +
+                                "falling back to Bukkit setSpectatorTarget(). This is unlikely to cause issues."
+                            );
                         }
                     }
                 }
@@ -151,11 +183,51 @@ public class SpectatorWorkarounds implements Listener {
             return;
         }
 
+        if (this.suppressStopSpectatingEvent) {
+            // On est en train de faire un clear temporaire (cross-world fix), ne touche pas à tempTargets
+            return;
+        }
+
         final Player spectator = event.getPlayer();
         final Entity target = event.getSpectatorTarget();
 
-        // the spectator has stopped spectating the target. so we don't want to re-apply if the target is tracked again.
+        // Le joueur a vraiment arrêté de spectate cette cible -> on ne veut plus ré-appliquer
         this.tempTargets.remove(spectator.getUniqueId(), target.getUniqueId());
+    }
+
+    /**
+     * Si LE JOUEUR (spectateur) se téléporte lui-même vers un autre monde
+     * (portail, /warp, etc.) alors qu’il est en train de spectate quelqu’un,
+     * on casse proprement le spectate pour éviter les désyncs.
+     */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTeleport(PlayerTeleportEvent event) {
+        if (!this.plugin.getServerConfig().workaroundTeleportOnUntrack) {
+            return;
+        }
+
+        if (event.getFrom().getWorld().equals(event.getTo().getWorld())) {
+            return;
+        }
+
+        final Player player = event.getPlayer();
+
+        // Si la cause est SPECTATE, c’est notre propre fallback (onUntrack) -> ne pas toucher
+        if (event.getCause() == PlayerTeleportEvent.TeleportCause.SPECTATE) {
+            return;
+        }
+
+        if (player.getSpectatorTarget() != null) {
+            this.suppressStopSpectatingEvent = true;
+            try {
+                player.setSpectatorTarget(null);
+            } finally {
+                this.suppressStopSpectatingEvent = false;
+            }
+
+            // On s'assure aussi de ne pas garder d'état en attente
+            this.tempTargets.remove(player.getUniqueId());
+        }
     }
 
     @EventHandler
