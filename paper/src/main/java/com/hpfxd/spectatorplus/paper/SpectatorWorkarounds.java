@@ -140,6 +140,10 @@ public class SpectatorWorkarounds implements Listener {
         final Player spectator = event.getPlayer();
         final Entity target = event.getNewSpectatorTarget();
 
+        if (!spectator.getWorld().equals(target.getWorld())) {
+            spectator.teleport(target, PlayerTeleportEvent.TeleportCause.SPECTATE);
+        }
+
         if (!target.getTrackedBy().contains(spectator)) {
             this.tempTargets.put(spectator.getUniqueId(), target.getUniqueId());
         }
