@@ -6,6 +6,7 @@ import com.hpfxd.spectatorplus.paper.util.ReflectionUtil;
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -41,9 +42,11 @@ public class SpectatorWorkarounds implements Listener {
 
             if (target != null) {
                 if (spectator.getWorld().equals(target.getWorld())) {
+                    final Location targetLocation = target.getLocation();
+
                     if (!this.directTeleportFailed) {
                         try {
-                            ReflectionUtil.directTeleport(spectator, target.getLocation());
+                            ReflectionUtil.directTeleport(spectator, targetLocation);
                         } catch (Throwable e) {
                             this.directTeleportFailed = true;
                             this.plugin.getSLF4JLogger().warn("auto-update-position workaround: Failed to call directTeleport, will not try again", e);
@@ -57,6 +60,8 @@ public class SpectatorWorkarounds implements Listener {
                         spectator.setSpectatorTarget(null);
                         spectator.setSpectatorTarget(target);
                     }
+
+                    spectator.setRotation(targetLocation.getYaw(), targetLocation.getPitch());
                 }
             }
         }
@@ -140,9 +145,13 @@ public class SpectatorWorkarounds implements Listener {
         final Player spectator = event.getPlayer();
         final Entity target = event.getNewSpectatorTarget();
 
+        final Location targetLocation = target.getLocation();
+
         if (!spectator.getWorld().equals(target.getWorld())) {
-            spectator.teleport(target, PlayerTeleportEvent.TeleportCause.SPECTATE);
+            spectator.teleport(targetLocation, PlayerTeleportEvent.TeleportCause.SPECTATE);
         }
+
+        spectator.setRotation(targetLocation.getYaw(), targetLocation.getPitch());
 
         if (!target.getTrackedBy().contains(spectator)) {
             this.tempTargets.put(spectator.getUniqueId(), target.getUniqueId());
